@@ -640,6 +640,9 @@ class GAMMA(object):
         gen_best_idx = np.argmax(fitness[:,0])
         return fitness, gen_best_idx
 
+
+
+
     def evaluate(self, pool, population, cur_gen=-1):
         gen_best = -float("Inf")
         gen_best_activity = None
@@ -650,7 +653,7 @@ class GAMMA(object):
         reward_activ_list = pool.map(self.thread_fun, population)
 
         for i in range(len(population)):
-            reward, activity_count = reward_activ_list[i]
+            reward, activity_count, raw_observation = reward_activ_list[i]
             if reward is None or any(np.array(reward) >= 0):
                 reward = [float("-Inf") for _ in range(len(self.best_reward))]
                 count_non_valid += 1
@@ -660,6 +663,41 @@ class GAMMA(object):
             #         count_non_valid += 1
             judging_reward = reward[self.stage_idx]
             self.fitness[i] = reward
+            
+            # --- population logging for visualization ---
+            is_valid = not (reward[0] == float("-Inf"))
+            is_elite = i < self.num_elite
+            raw_obs = raw_observation if is_valid else None
+            self.population_log.append({
+                # provenance
+                "generation":    cur_gen,
+                "individual_idx": i,
+                "is_valid":      is_valid,
+                "is_elite":      is_elite,
+                # raw genome (kept as-is for reference)
+                "genome":        copy.deepcopy(population[i]),
+                # fixed-length encoded vector for ML
+                "genome_vec":    self.encode_genome(population[i]).tolist(),
+                "feature_names": self.genome_feature_names,
+                # all fitness dimensions, not just the primary
+                "reward":        list(reward),
+                # MAESTRO scalars — None if invalid
+                "runtime":       float(raw_obs[0]) if raw_obs else None,
+                "throughput":    float(raw_obs[1]) if raw_obs else None,
+                "energy":        float(raw_obs[2]) if raw_obs else None,
+                "area":          float(raw_obs[3]) if raw_obs else None,
+                "l1_size":       float(raw_obs[4]) if raw_obs else None,
+                "l2_size":       float(raw_obs[5]) if raw_obs else None,
+                "num_mac":       float(raw_obs[6]) if raw_obs else None,
+                "power":         float(raw_obs[7]) if raw_obs else None,
+                "num_pe":        float(raw_obs[8]) if raw_obs else None,
+                # structural genome metadata
+                "num_levels":    len(population[i]) // 7,
+                "sp_dims":       [population[i][lvl * 7][0] for lvl in range(len(population[i]) // 7)],
+                "sp_szs":        [population[i][lvl * 7][1] for lvl in range(len(population[i]) // 7)],
+            })
+            # --- end population logging ---
+            
             if gen_best < judging_reward:
                 gen_best = judging_reward
                 gen_best_activity = activity_count
@@ -822,7 +860,8 @@ class GAMMA(object):
 
     def thread_fun(self, individual):
         reward, activity_count = self.oberserve_maestro(individual)
-        return [reward, activity_count]
+        observation = self.observation if hasattr(self, 'observation') and reward is not None else None
+        return [reward, activity_count, observation]
 
     def get_indiv_info(self, individual, num_pe=None, l1_size=None, l2_size=None, NocBW=None):
         self.oberserve_maestro(individual,num_pe=num_pe, l1_size=l1_size, l2_size=l2_size, NocBW=NocBW)
@@ -1055,6 +1094,69 @@ class GAMMA(object):
             else:
                 print(indv[k:k+7])
 
+    def encode_genome(self, indv):
+        """
+        Encode a variable-length genome into a fixed-length numeric feature vector
+        suitable for PCA, clustering, and other ML techniques.
+
+        For each level in the hierarchy (each 7-gene block), encodes:
+          - Spatial dim (sp):      6-element one-hot over [K, C, Y, X, R, S]
+          - Cluster size (sp_sz):  1 scalar
+          - Tile sizes:            6 scalars, one per dimension, in canonical order
+          - Loop order ranks:      6 scalars, rank of each dim in the loop nest (0=innermost)
+
+        Levels beyond slevel_max are zero-padded so the vector length is always
+        slevel_max * 19 features, regardless of how many levels this individual has.
+
+        Feature names are stored in self.genome_feature_names (set on first call).
+        """
+        DIMS = ["K", "C", "Y", "X", "R", "S"]
+        features_per_level = 19  # 6 one-hot + 1 sp_sz + 6 tile sizes + 6 order ranks
+        total_features = self.slevel_max * features_per_level
+        vec = np.zeros(total_features, dtype=float)
+
+        num_levels = len(indv) // 7
+        for lvl in range(num_levels):
+            block = indv[lvl * 7: lvl * 7 + 7]
+            offset = lvl * features_per_level
+
+            # --- spatial parallelism dim: one-hot ---
+            sp_dim = block[0][0]
+            sp_sz  = block[0][1]
+            if sp_dim in DIMS:
+                vec[offset + DIMS.index(sp_dim)] = 1.0
+            # --- cluster size ---
+            vec[offset + 6] = float(sp_sz)
+
+            # --- tile sizes in canonical dim order ---
+            tile_dict = {gene[0]: gene[1] for gene in block[1:]}
+            for di, dim in enumerate(DIMS):
+                vec[offset + 7 + di] = float(tile_dict.get(dim, 0))
+
+            # --- loop order ranks (position in loop nest, 0 = outermost gene slot) ---
+            order_rank = {gene[0]: rank for rank, gene in enumerate(block[1:])}
+            for di, dim in enumerate(DIMS):
+                vec[offset + 13 + di] = float(order_rank.get(dim, 0))
+
+        # Build feature name list once
+        if not hasattr(self, "genome_feature_names"):
+            names = []
+            for lvl in range(self.slevel_max):
+                prefix = f"L{lvl+1}"
+                for dim in DIMS:
+                    names.append(f"{prefix}_sp_{dim}")
+                names.append(f"{prefix}_sp_sz")
+                for dim in DIMS:
+                    names.append(f"{prefix}_tile_{dim}")
+                for dim in DIMS:
+                    names.append(f"{prefix}_order_{dim}")
+            self.genome_feature_names = names
+
+        return vec
+
+
+
+
     def init_arguement(self, dimension=None, stage_idx=0, prev_stage_value=0, num_population=100, num_generations=100,
                        elite_ratio=0.05,
                        parents_ratio=0.15, ratio_decay=1, num_finetune=1, best_sol_1st=None, init_pop=None, uni_base=False, use_factor=False, use_pleteau=False,L1_bias_template=None):
@@ -1081,4 +1183,5 @@ class GAMMA(object):
         self.best_sol_pleteau = None
         self.normalize=True   if self.fitness_objective[0][:1] == "n" else False
         self.L1_bias_template =L1_bias_template
+        self.population_log = []
 
